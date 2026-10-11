@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"lab1/rpc"
+	"Reflection-based-RPC-System/rpc"
 )
 
 type pingServer struct{}

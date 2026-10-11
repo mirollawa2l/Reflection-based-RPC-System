@@ -1,5 +1,6 @@
-// Package rpc is an intentionally incomplete RMI assignment template.
 package rpc
+
+// Package rpc is an intentionally incomplete RMI assignment template.
 
 import (
 	"bufio"
@@ -11,6 +12,7 @@ import (
 	"reflect"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -55,22 +57,121 @@ func NewServer(receiver any) (*Server, error) {
 
 // TODO 1: Create the TCP listener, reject duplicate starts, save lifecycle state,
 // and launch the accept loop without blocking the caller.
-// Start begins accepting remote calls at address. Use port 0 to request an available port.
 func (s *Server) Start(address string) error {
-	return errors.New("TODO: implement Server.Start")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	//  Benet2kd an el server msh sh8al asln (law el listener msh nil).
+	// Dah bymn3 en 7ad y3ml start marra tanya w hwa sh8al (reject duplicate starts).
+	if s.listener != nil {
+		return errors.New("server is already running")
+	}
+
+	//  Benft7 TCP listener 3ala el address el matloob (lw b3t "127.0.0.1:0",
+	// el OS hwa elly bykhtar port fadya we ye7gezha).
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+
+	//  Ben7fez el listener gwa el server struct w ben3ml initialization ll channels
+	// elly btsa3dna nenazelem el accept loop w n2flha b aman.
+	s.listener = listener
+	s.stopped = make(chan struct{})
+	s.acceptDone = make(chan struct{})
+
+	//  Benbda2 el accept loop fe background goroutine 3ashan el function teRga3
+	// men gher ma ta3ml block ll caller w tefdal tst2bel connections gdeda.
+	go s.acceptLoop()
+	return nil
 }
 
-// TODO 2: Return the listener address safely while allowing port 0 discovery.
-// Address returns the address assigned to the running server.
+func (s *Server) acceptLoop() {
+	defer close(s.acceptDone)
+	for {
+		s.mu.Lock()
+		listener := s.listener
+		s.mu.Unlock()
+
+		if listener == nil {
+			return
+		}
+
+		conn, err := listener.Accept()
+		if err != nil {
+			s.mu.Lock()
+			select {
+			case <-s.stopped:
+				s.mu.Unlock()
+				return
+			default:
+				s.mu.Unlock()
+				return
+			}
+		}
+
+		s.mu.Lock()
+		if s.listener == nil {
+			s.mu.Unlock()
+			conn.Close()
+			return
+		}
+		s.workers.Add(1)
+		s.mu.Unlock()
+
+		go func(c net.Conn) {
+			defer s.workers.Done()
+			s.handle(c)
+		}(conn)
+	}
+}
+
+// Task 2: `Server.Address` (ageeb 3la el address elly el server sh8al 3aleih)
+
 func (s *Server) Address() string {
-	return ""
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Law el server msh sh8al (listener == nil), benrg3 empty string
+	// ( abl el start aw ba3d el stop).
+	if s.listener == nil {
+		return ""
+	}
+
+	// Benrg3 el string bta3 el address elly el listener sh8al 3aleih
+	// (w da by3rafna el port el 7a2i2y law knt ba3t port 0 fe el Start).
+	return s.listener.Addr().String()
 }
 
-// TODO 3: Close the listener, signal the accept loop, wait for its workers,
-// and leave the server in a state where Start can be called again.
-// Stop stops accepting new connections and waits for active handlers to finish.
+//Task 3: `Server.Stop` (Ezaay n2fl el Server  w nstany el active requests tkhls)
+
 func (s *Server) Stop() error {
-	return errors.New("TODO: implement Server.Stop")
+	s.mu.Lock()
+
+	// Law el server asln msh sh8al, benrg3  (safe to call before start or multiple times).
+	if s.listener == nil {
+		s.mu.Unlock()
+		return nil
+	}
+
+	listener := s.listener
+	s.listener = nil // Benfeady el listener w nsfro
+	stoppedChan := s.stopped
+	s.mu.Unlock()
+
+	// 1. Benbe3t signal ll accept loop enha tetla3 (close el stopped channel)
+	// w ben2fl el listener 3ashan el Accept() yetkaser wmayfdalsh mstny.
+	close(stoppedChan)
+	listener.Close()
+
+	// 2. Benstany el accept loop tetla3 tamam
+	<-s.acceptDone
+
+	// 3. Benstany kol el active workers (connections elly betaamalha handle gowa)
+	// enha tkheles sh8alha tamam (workers.Wait). Dah bykhly el server yestany el active requests tkhls.
+	s.workers.Wait()
+
+	return nil
 }
 
 // TODO 4: Study this starter request handler, then complete and test the protocol
@@ -115,7 +216,45 @@ func (s *Server) handle(connection net.Conn) {
 // larger than maxArgumentBytes, and requests larger than maxRequestBytes.
 // validateRequest rejects malformed or abusive requests before reflection runs.
 func validateRequest(req request) error {
-	return errors.New("TODO: implement validateRequest")
+
+	// 1. Check if the method name is empty.
+	if req.Method == "" {
+		return errors.New("method cannot be empty")
+	}
+
+	// 2. Check if the method name contains whitespace or control characters.
+	for _, ch := range req.Method {
+		if unicode.IsSpace(ch) || unicode.IsControl(ch) {
+			return errors.New("method contains whitespace or control characters")
+		}
+	}
+
+	// 3. Check if the number of arguments exceeds the maximum allowed.
+	if len(req.Args) > maxArguments {
+		return errors.New("too many arguments")
+	}
+
+	// 4. Check the size of each argument and calculate the total size.
+	totalSize := 0
+
+	for _, arg := range req.Args {
+
+		// Reject an individual argument that exceeds the size limit.
+		if len(arg) > maxArgumentBytes {
+			return errors.New("argument is larger than maxArgumentBytes")
+		}
+
+		// Add the argument size to the total.
+		totalSize += len(arg)
+	}
+
+	// 5. Reject requests whose combined argument size exceeds the limit.
+	if totalSize > maxRequestBytes {
+		return errors.New("request is larger than maxRequestBytes")
+	}
+
+	// All validation checks passed.
+	return nil
 }
 
 // TODO 6: Study and test this starter reflection bridge. Your required work is to
@@ -126,6 +265,7 @@ func validateRequest(req request) error {
 // your chosen assignment protocol requires another result or argument rule.
 // invoke finds a method, converts JSON arguments to its parameter types, and calls it.
 func (s *Server) invoke(req request) (any, error) {
+	//find the method name by relection
 	method := reflect.ValueOf(s.receiver).MethodByName(req.Method)
 	if !method.IsValid() {
 		return nil, fmt.Errorf("unknown method %q", req.Method)
