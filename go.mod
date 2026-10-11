@@ -1,3 +1,3 @@
-module lab1
+module rpc
 
-go 1.20
+go 1.27.2
