@@ -173,10 +173,12 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// ==========================================
-// OTHER TEAMMATES' SECTIONS (Stubs / Existing)
-// ==========================================
-
+// TODO 4: Study this starter request handler, then complete and test the protocol
+// contract. Add tests for malformed JSON, oversized input, remote errors, panics,
+// and successful calls, and make sure one bad request cannot crash the server or
+// leave a connection hanging. Connect this handler to your completed Start and
+// Stop lifecycle so each accepted connection is processed by a worker safely.
+// handle reads one request, invokes it, and writes one response.
 func (s *Server) handle(connection net.Conn) {
 	defer connection.Close()
 	encoder := json.NewEncoder(connection)
@@ -209,19 +211,81 @@ func (s *Server) handle(connection net.Conn) {
 	_ = encoder.Encode(response{OK: true, Value: payload})
 }
 
+// TODO 5: Reject empty or unsafe method names, too many arguments, arguments
+// larger than maxArgumentBytes, and requests larger than maxRequestBytes.
+// validateRequest rejects malformed or abusive requests before reflection runs.
 func validateRequest(req request) error {
 	return errors.New("TODO: implement validateRequest")
 }
 
+// TODO 6: Study and test this starter reflection bridge. Your required work is to
+// support and test exported methods with zero arguments, typed arguments, no
+// return value, one return value, and a final error return; unknown methods,
+// wrong argument counts, invalid JSON arguments, returned errors, and panics must
+// become clear errors instead of crashing the server. Extend the bridge only when
+// your chosen assignment protocol requires another result or argument rule.
+// invoke finds a method, converts JSON arguments to its parameter types, and calls it.
 func (s *Server) invoke(req request) (any, error) {
-	return nil, errors.New("TODO: implement Server.invoke")
+	method := reflect.ValueOf(s.receiver).MethodByName(req.Method)
+	if !method.IsValid() {
+		return nil, fmt.Errorf("unknown method %q", req.Method)
+	}
+	typeOfMethod := method.Type()
+	if typeOfMethod.NumIn() != len(req.Args) {
+		return nil, fmt.Errorf("method %q expects %d arguments, got %d", req.Method, typeOfMethod.NumIn(), len(req.Args))
+	}
+	arguments := make([]reflect.Value, len(req.Args))
+	for index, raw := range req.Args {
+		argument := reflect.New(typeOfMethod.In(index))
+		if err := json.Unmarshal(raw, argument.Interface()); err != nil {
+			return nil, fmt.Errorf("argument %d: %v", index, err)
+		}
+		arguments[index] = argument.Elem()
+	}
+	outputs, err := callMethodSafely(method, arguments)
+	if err != nil {
+		return nil, err
+	}
+	if len(outputs) == 0 {
+		return nil, nil
+	}
+	if last := outputs[len(outputs)-1]; last.Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		if !isNilValue(last) {
+			return nil, last.Interface().(error)
+		}
+		outputs = outputs[:len(outputs)-1]
+	}
+	if len(outputs) == 0 {
+		return nil, nil
+	}
+	return outputs[0].Interface(), nil
 }
 
+func isNilValue(value reflect.Value) bool {
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func callMethodSafely(method reflect.Value, arguments []reflect.Value) (outputs []reflect.Value, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("remote method panicked: %v", recovered)
+		}
+	}()
+	return method.Call(arguments), nil
+}
+
+// Client calls methods on a remote Server.
 type Client struct {
 	Address string
 	Timeout time.Duration
 }
 
+// NewClient creates a client for a server address.
 func NewClient(address string) (*Client, error) {
 	if address == "" {
 		return nil, errors.New("address cannot be empty")
@@ -229,6 +293,9 @@ func NewClient(address string) (*Client, error) {
 	return &Client{Address: address, Timeout: defaultCallTimeout}, nil
 }
 
+// TODO 7: Open one connection, apply a deadline, encode the request, read one
+// response, return remote errors, and decode the response into out.
+// Call invokes method and decodes its result into out. Pass nil for no result.
 func (c *Client) Call(method string, out any, args ...any) error {
 	return errors.New("TODO: implement Client.Call")
 }
