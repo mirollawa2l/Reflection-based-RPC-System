@@ -126,8 +126,8 @@ func (s *Server) acceptLoop() {
 	}
 }
 
-// Task 2: `Server.Address` (ageeb 3la el address elly el server sh8al 3aleih)
-
+// TODO 2: Return the listener address safely while allowing port 0 discovery.
+// Address returns the address assigned to the running server.
 func (s *Server) Address() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -143,7 +143,9 @@ func (s *Server) Address() string {
 	return s.listener.Addr().String()
 }
 
-//Task 3: `Server.Stop` (Ezaay n2fl el Server  w nstany el active requests tkhls)
+// TODO 3: Close the listener, signal the accept loop, wait for its workers,
+// and leave the server in a state where Start can be called again.
+// Stop stops accepting new connections and waits for active handlers to finish.
 
 func (s *Server) Stop() error {
 	s.mu.Lock()
@@ -174,26 +176,13 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// TODO 4: Study this starter request handler, then
-//
-//	complete and test the protocol contract.
-//	Add tests for malformed JSON,
-//	oversized input done
-//
-// , remote errors,
-//
-//	panics,
-//
-// and successful calls,
-//
-//	and make sure one bad request cannot crash the server or
-//
-// leave a connection hanging.
-//
-//	Connect this handler to your completed Start and
-//
+// TODO 4: Study this starter request handler, then complete and test the protocol
+// contract. Add tests for malformed JSON, oversized input, remote errors, panics,
+// and successful calls, and make sure one bad request cannot crash the server or
+// leave a connection hanging. Connect this handler to your completed Start and
 // Stop lifecycle so each accepted connection is processed by a worker safely.
 // handle reads one request, invokes it, and writes one response.
+
 func (s *Server) handle(connection net.Conn) {
 	defer connection.Close() //close conn when finished
 
