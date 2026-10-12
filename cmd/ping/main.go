@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"log"
 	"time"
-
-	"Reflection-based-RPC-System/rpc"
+	// "Reflection-based-RPC-System/rpc"
+    // "rpc"
+ "app/rpc"
 )
 
 type pingServer struct{}

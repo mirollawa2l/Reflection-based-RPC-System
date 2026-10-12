@@ -336,6 +336,69 @@ func NewClient(address string) (*Client, error) {
 // TODO 7: Open one connection, apply a deadline, encode the request, read one
 // response, return remote errors, and decode the response into out.
 // Call invokes method and decodes its result into out. Pass nil for no result.
+// Client.Call invokes a remote method and decodes its result into out. Pass nil for no result.
 func (c *Client) Call(method string, out any, args ...any) error {
-	return errors.New("TODO: implement Client.Call")
+	// 1. Reject an empty method name.
+	if method == "" {
+		return errors.New("method cannot be empty")
+	}
+
+	// 2. Open one TCP connection to the server.
+	conn, err := net.Dial("tcp", c.Address)
+	if err != nil {
+		return fmt.Errorf("connection failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 3. Apply the configured timeout as a connection and I/O deadline.
+	if c.Timeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(c.Timeout)); err != nil {
+			return fmt.Errorf("failed to set deadline: %v", err)
+		}
+	}
+
+	// 4. Marshal each argument into json.RawMessage so the server receives them as raw JSON bytes.
+	rawArgs := make([]json.RawMessage, len(args))
+	for i, arg := range args {
+		b, err := json.Marshal(arg)
+		if err != nil {
+			return fmt.Errorf("failed to marshal argument %d: %v", i, err)
+		}
+		rawArgs[i] = b
+	}
+
+	req := request{
+		Method: method,
+		Args:   rawArgs,
+	}
+
+	// 5. Encode and send the request over TCP.
+	encoder := json.NewEncoder(conn)
+	if err := encoder.Encode(req); err != nil {
+		return fmt.Errorf("failed to encode request: %v", err)
+	}
+
+	// 6. Read and decode the server's response.
+	var resp response
+	decoder := json.NewDecoder(conn)
+	if err := decoder.Decode(&resp); err != nil {
+		return fmt.Errorf("failed to decode response: %v", err)
+	}
+
+	// 7. Check if the remote call failed and return the server error.
+	if !resp.OK {
+		if resp.Error != "" {
+			return errors.New(resp.Error)
+		}
+		return errors.New("remote call failed")
+	}
+
+	// 8. Decode the returned value into out (if out is provided and response has a value).
+	if out != nil && len(resp.Value) > 0 {
+		if err := json.Unmarshal(resp.Value, out); err != nil {
+			return fmt.Errorf("failed to decode return value: %v", err)
+		}
+	}
+
+	return nil
 }
