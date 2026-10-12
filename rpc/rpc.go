@@ -174,42 +174,117 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// TODO 4: Study this starter request handler, then complete and test the protocol
-// contract. Add tests for malformed JSON, oversized input, remote errors, panics,
-// and successful calls, and make sure one bad request cannot crash the server or
-// leave a connection hanging. Connect this handler to your completed Start and
+// TODO 4: Study this starter request handler, then
+//
+//	complete and test the protocol contract.
+//	Add tests for malformed JSON,
+//	oversized input done
+//
+// , remote errors,
+//
+//	panics,
+//
+// and successful calls,
+//
+//	and make sure one bad request cannot crash the server or
+//
+// leave a connection hanging.
+//
+//	Connect this handler to your completed Start and
+//
 // Stop lifecycle so each accepted connection is processed by a worker safely.
 // handle reads one request, invokes it, and writes one response.
 func (s *Server) handle(connection net.Conn) {
-	defer connection.Close()
+	defer connection.Close() //close conn when finished
+
+	const readTimeout = 5 * time.Second
+	const writeTimeout = 5 * time.Second
+
+	//prepare encoder
 	encoder := json.NewEncoder(connection)
+	//sending responses with a write deadline.
+
+	sendResponse := func(resp response) {
+		_ = connection.SetWriteDeadline(
+			time.Now().Add(writeTimeout),
+		)
+		_ = encoder.Encode(resp)
+	}
+
+	// Recover from unexpected panics.
 	defer func() {
+		//recover() — prevents a panic from escaping
 		if recovered := recover(); recovered != nil {
-			_ = encoder.Encode(response{Error: fmt.Sprintf("remote method panicked: %v", recovered)})
+			sendResponse(response{
+				Error: fmt.Sprintf(
+					"remote method panicked: %v",
+					recovered,
+				),
+			})
 		}
 	}()
 
+	// Prevent the client from blocking reads forever. read before deadline
+	if err := connection.SetReadDeadline(
+		time.Now().Add(readTimeout),
+	); err != nil {
+		sendResponse(response{
+			Error: fmt.Sprintf("set read deadline: %v", err),
+		})
+		return
+	}
+	// 5. Read at most maxRequestBytes + 1 bytes.
 	decoder := json.NewDecoder(bufio.NewReader(io.LimitReader(connection, maxRequestBytes+1)))
+
 	var req request
-	if err := decoder.Decode(&req); err != nil {
-		_ = encoder.Encode(response{Error: fmt.Sprintf("invalid request: %v", err)})
+
+	err := decoder.Decode(&req)
+	// Remove the deadline.
+	_ = connection.SetReadDeadline(time.Time{})
+
+	if err != nil {
+		sendResponse(response{
+			Error: fmt.Sprintf("invalid request: %v", err),
+		})
 		return
 	}
+
+	// Reject an oversized JSON request.
+	if decoder.InputOffset() > maxRequestBytes {
+		sendResponse(response{
+			Error: "request is larger than allowed",
+		})
+		return
+	}
+
 	if err := validateRequest(req); err != nil {
-		_ = encoder.Encode(response{Error: err.Error()})
+		sendResponse(response{
+			Error: err.Error(),
+		})
 		return
 	}
+	// Find and execute the requested method.
 	result, err := s.invoke(req)
 	if err != nil {
-		_ = encoder.Encode(response{Error: err.Error()})
+		sendResponse(response{
+			Error: err.Error(),
+		})
 		return
 	}
+	//Convert the method result into JSON.
 	payload, err := json.Marshal(result)
+
 	if err != nil {
-		_ = encoder.Encode(response{Error: fmt.Sprintf("encode result: %v", err)})
+		sendResponse(response{
+			Error: fmt.Sprintf("encode result: %v", err),
+		})
 		return
 	}
-	_ = encoder.Encode(response{OK: true, Value: payload})
+	//Send the successful response.
+	sendResponse(response{
+		OK:    true,
+		Value: payload,
+	})
 }
 
 // TODO 5: Reject empty or unsafe method names, too many arguments, arguments
@@ -267,22 +342,53 @@ func validateRequest(req request) error {
 func (s *Server) invoke(req request) (any, error) {
 	//find the method name by relection
 	method := reflect.ValueOf(s.receiver).MethodByName(req.Method)
+	//if meth not exist err
 	if !method.IsValid() {
 		return nil, fmt.Errorf("unknown method %q", req.Method)
 	}
+	//get meth typr info and check if the number of arguments matches the number of arguments in the request
 	typeOfMethod := method.Type()
 	if typeOfMethod.NumIn() != len(req.Args) {
 		return nil, fmt.Errorf("method %q expects %d arguments, got %d", req.Method, typeOfMethod.NumIn(), len(req.Args))
 	}
+
+	// Check supported return signatures.
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+
+	switch typeOfMethod.NumOut() {
+	case 0, 1:
+		// Supported: no result, one result, or error only.
+
+	case 2:
+		// Two results require the final result to be an error.
+		if !typeOfMethod.Out(1).Implements(errorType) {
+			return nil, fmt.Errorf(
+				"method %q has unsupported return signature",
+				req.Method,
+			)
+		}
+
+	default:
+		return nil, fmt.Errorf(
+			"method %q has unsupported return signature",
+			req.Method,
+		)
+	}
+
+	// Convert JSON arguments into Go values.
 	arguments := make([]reflect.Value, len(req.Args))
 	for index, raw := range req.Args {
+		//find expected arg type and allocate value
 		argument := reflect.New(typeOfMethod.In(index))
+		//decode raw JSOn into that type
 		if err := json.Unmarshal(raw, argument.Interface()); err != nil {
 			return nil, fmt.Errorf("argument %d: %v", index, err)
 		}
 		arguments[index] = argument.Elem()
 	}
+
 	outputs, err := callMethodSafely(method, arguments)
+
 	if err != nil {
 		return nil, err
 	}
@@ -293,11 +399,13 @@ func (s *Server) invoke(req request) (any, error) {
 		if !isNilValue(last) {
 			return nil, last.Interface().(error)
 		}
-		outputs = outputs[:len(outputs)-1]
+		outputs = outputs[:len(outputs)-1] // Remove the nil error from the results.
 	}
+	//Handle methods returning only a nil error.
 	if len(outputs) == 0 {
 		return nil, nil
 	}
+	//Return the successful method result.
 	return outputs[0].Interface(), nil
 }
 

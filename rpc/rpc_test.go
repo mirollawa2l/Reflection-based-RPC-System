@@ -362,3 +362,73 @@ func testClient(t *testing.T, server *Server) *Client {
 	}
 	return client
 }
+
+func TestHandleReadTimeout(t *testing.T) {
+	server, err := NewServer(&testService{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	go server.handle(serverConn)
+
+	clientConn.SetReadDeadline(time.Now().Add(8 * time.Second))
+
+	var resp response
+	err = json.NewDecoder(clientConn).Decode(&resp)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.OK || !strings.Contains(
+		strings.ToLower(resp.Error), "timeout",
+	) {
+		t.Fatalf("expected timeout error, got %+v", resp)
+	}
+}
+
+func TestHandleDirectly(t *testing.T) {
+	server, err := NewServer(&testService{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	// Run the handler independently.
+	go server.handle(serverConn)
+
+	// Prevent the test itself from hanging.
+	_ = clientConn.SetDeadline(
+		time.Now().Add(3 * time.Second),
+	)
+
+	// Send an RPC request.
+	req := request{
+		Method: "Add",
+		Args: []json.RawMessage{
+			json.RawMessage("2"),
+			json.RawMessage("3"),
+		},
+	}
+
+	if err := json.NewEncoder(clientConn).Encode(req); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the response.
+	var resp response
+
+	if err := json.NewDecoder(clientConn).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Check the result.
+	if !resp.OK || string(resp.Value) != "5" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
