@@ -22,6 +22,12 @@ const (
 	defaultCallTimeout = 5 * time.Second
 )
 
+// const (
+// 	requestReadTimeout   = 5 * time.Second
+// 	responseWriteTimeout = 5 * time.Second
+// 	drainTimeout         = time.Second
+// )
+
 type request struct {
 	Method string            `json:"method"`
 	Args   []json.RawMessage `json:"args"`
@@ -40,7 +46,8 @@ type Server struct {
 	stopped    chan struct{}
 	acceptDone chan struct{}
 	workers    sync.WaitGroup
-	mu         sync.Mutex
+	mu         sync.Mutex // guards listener, stopped and acceptDone (held only briefly
+    lifecycle  sync.Mutex // serializes Start and Stop so they never overlap
 }
 
 // NewServer creates a server for a non-nil pointer receiver.
@@ -58,6 +65,9 @@ func NewServer(receiver any) (*Server, error) {
 // TODO 1: Create the TCP listener, reject duplicate starts, save lifecycle state,
 // and launch the accept loop without blocking the caller.
 func (s *Server) Start(address string) error {
+	s.lifecycle.Lock()          // Acquire the lock to prevent other goroutines from accessing the protected resource simultaneously.
+defer s.lifecycle.Unlock()  // Ensure the lock is released when the function returns, even if it returns early.
+	
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -148,6 +158,11 @@ func (s *Server) Address() string {
 // Stop stops accepting new connections and waits for active handlers to finish.
 
 func (s *Server) Stop() error {
+	// Holding lifecycle for the whole shutdown means a concurrent Start waits
+	// for Stop to finish and a concurrent second Stop becomes a no-op.
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	
 	s.mu.Lock()
 
 	// Law el server asln msh sh8al, benrg3  (safe to call before start or multiple times).
@@ -183,26 +198,44 @@ func (s *Server) Stop() error {
 // Stop lifecycle so each accepted connection is processed by a worker safely.
 // handle reads one request, invokes it, and writes one response.
 
-func (s *Server) handle(connection net.Conn) {
-	defer connection.Close() //close conn when finished
-
-	const readTimeout = 5 * time.Second
+const readTimeout = 5 * time.Second
 	const writeTimeout = 5 * time.Second
+	const drainTimeout= time.Second
 
-	//prepare encoder
+func (s *Server) handle(connection net.Conn) {
+	// Close the connection when the handler finishes.
+	defer connection.Close()
+
+	// Prepare the JSON encoder used to send the response.
 	encoder := json.NewEncoder(connection)
-	//sending responses with a write deadline.
 
+	// Track whether unread client input should be drained before closing.
+	drainInput := false
+
+	// sendResponse writes one response and marks failed requests for draining.
 	sendResponse := func(resp response) {
+		if !resp.OK {
+			drainInput = true
+		}
+
+		// Prevent writing the response from blocking indefinitely.
 		_ = connection.SetWriteDeadline(
 			time.Now().Add(writeTimeout),
 		)
+
 		_ = encoder.Encode(resp)
 	}
 
-	// Recover from unexpected panics.
+	// Deferred calls run last-in, first-out:
+	// recover first, then drain unread input, then close the connection.
 	defer func() {
-		//recover() — prevents a panic from escaping
+		if drainInput {
+			drainConnection(connection)
+		}
+	}()
+
+	// Recover from unexpected panics so they do not crash the server.
+	defer func() {
 		if recovered := recover(); recovered != nil {
 			sendResponse(response{
 				Error: fmt.Sprintf(
@@ -213,7 +246,7 @@ func (s *Server) handle(connection net.Conn) {
 		}
 	}()
 
-	// Prevent the client from blocking reads forever. read before deadline
+	// Set a deadline so reading the request cannot block indefinitely.
 	if err := connection.SetReadDeadline(
 		time.Now().Add(readTimeout),
 	); err != nil {
@@ -222,23 +255,27 @@ func (s *Server) handle(connection net.Conn) {
 		})
 		return
 	}
-	// 5. Read at most maxRequestBytes + 1 bytes.
-	decoder := json.NewDecoder(bufio.NewReader(io.LimitReader(connection, maxRequestBytes+1)))
+
+	// Read at most maxRequestBytes + 1 bytes to detect oversized requests.
+	decoder := json.NewDecoder(
+		bufio.NewReader(
+			io.LimitReader(connection, maxRequestBytes+1),
+		),
+	)
 
 	var req request
 
-	err := decoder.Decode(&req)
-	// Remove the deadline.
-	_ = connection.SetReadDeadline(time.Time{})
-
-	if err != nil {
+	if err := decoder.Decode(&req); err != nil {
 		sendResponse(response{
 			Error: fmt.Sprintf("invalid request: %v", err),
 		})
 		return
 	}
 
-	// Reject an oversized JSON request.
+	// Clear the read deadline after receiving the request.
+	_ = connection.SetReadDeadline(time.Time{})
+
+	// Reject oversized JSON requests.
 	if decoder.InputOffset() > maxRequestBytes {
 		sendResponse(response{
 			Error: "request is larger than allowed",
@@ -246,12 +283,14 @@ func (s *Server) handle(connection net.Conn) {
 		return
 	}
 
+	// Validate the request before invoking the remote method.
 	if err := validateRequest(req); err != nil {
 		sendResponse(response{
 			Error: err.Error(),
 		})
 		return
 	}
+
 	// Find and execute the requested method.
 	result, err := s.invoke(req)
 	if err != nil {
@@ -260,21 +299,30 @@ func (s *Server) handle(connection net.Conn) {
 		})
 		return
 	}
-	//Convert the method result into JSON.
-	payload, err := json.Marshal(result)
 
+	// Convert the method result into JSON.
+	payload, err := json.Marshal(result)
 	if err != nil {
 		sendResponse(response{
 			Error: fmt.Sprintf("encode result: %v", err),
 		})
 		return
 	}
-	//Send the successful response.
+
+	// Send the successful response.
 	sendResponse(response{
 		OK:    true,
 		Value: payload,
 	})
 }
+
+
+// drainConnection discards (a bounded amount of) leftover client input.
+func drainConnection(connection net.Conn) {
+	_ = connection.SetReadDeadline(time.Now().Add(drainTimeout))
+	_, _ = io.Copy(io.Discard, io.LimitReader(connection, 2*maxRequestBytes))
+}
+
 
 // TODO 5: Reject empty or unsafe method names, too many arguments, arguments
 // larger than maxArgumentBytes, and requests larger than maxRequestBytes.
@@ -337,6 +385,7 @@ func (s *Server) invoke(req request) (any, error) {
 	}
 	//get meth typr info and check if the number of arguments matches the number of arguments in the request
 	typeOfMethod := method.Type()
+
 	if typeOfMethod.NumIn() != len(req.Args) {
 		return nil, fmt.Errorf("method %q expects %d arguments, got %d", req.Method, typeOfMethod.NumIn(), len(req.Args))
 	}
@@ -434,68 +483,67 @@ func NewClient(address string) (*Client, error) {
 // response, return remote errors, and decode the response into out.
 // Call invokes method and decodes its result into out. Pass nil for no result.
 // Client.Call invokes a remote method and decodes its result into out. Pass nil for no result.
+
 func (c *Client) Call(method string, out any, args ...any) error {
-	// 1. Reject an empty method name.
 	if method == "" {
 		return errors.New("method cannot be empty")
 	}
-
-	// 2. Open one TCP connection to the server.
-	conn, err := net.Dial("tcp", c.Address)
-	if err != nil {
-		return fmt.Errorf("connection failed: %v", err)
+	timeout := c.Timeout
+	if timeout <= 0 {
+		timeout = defaultCallTimeout
 	}
-	defer conn.Close()
-
-	// 3. Apply the configured timeout as a connection and I/O deadline.
-	if c.Timeout > 0 {
-		if err := conn.SetDeadline(time.Now().Add(c.Timeout)); err != nil {
-			return fmt.Errorf("failed to set deadline: %v", err)
-		}
-	}
-
-	// 4. Marshal each argument into json.RawMessage so the server receives them as raw JSON bytes.
-	rawArgs := make([]json.RawMessage, len(args))
-	for i, arg := range args {
-		b, err := json.Marshal(arg)
+ 
+	// Encode first: a bad argument fails fast without touching the network.
+	encoded := make([]json.RawMessage, len(args)) // never nil, so it is sent as []
+	for index, argument := range args {
+		raw, err := json.Marshal(argument)
 		if err != nil {
-			return fmt.Errorf("failed to marshal argument %d: %v", i, err)
+			return fmt.Errorf("encode argument %d: %w", index, err)
 		}
-		rawArgs[i] = b
+		encoded[index] = raw
 	}
-
-	req := request{
-		Method: method,
-		Args:   rawArgs,
+ 
+	deadline := time.Now().Add(timeout)
+	dialer := net.Dialer{Deadline: deadline}
+	connection, err := dialer.Dial("tcp", c.Address)
+	if err != nil {
+		return describeNetError(fmt.Sprintf("connect to %s", c.Address), err, timeout)
 	}
-
-	// 5. Encode and send the request over TCP.
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(req); err != nil {
-		return fmt.Errorf("failed to encode request: %v", err)
+	defer connection.Close()
+	// One deadline covers the whole exchange: sending, the remote execution and reading.
+	if err := connection.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
 	}
-
-	// 6. Read and decode the server's response.
-	var resp response
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&resp); err != nil {
-		return fmt.Errorf("failed to decode response: %v", err)
+ 
+	if err := json.NewEncoder(connection).Encode(request{Method: method, Args: encoded}); err != nil {
+		return describeNetError("send request", err, timeout)
 	}
-
-	// 7. Check if the remote call failed and return the server error.
-	if !resp.OK {
-		if resp.Error != "" {
-			return errors.New(resp.Error)
+ 
+	var reply response
+	if err := json.NewDecoder(bufio.NewReader(connection)).Decode(&reply); err != nil {
+		return describeNetError("read response", err, timeout)
+	}
+	if !reply.OK {
+		if reply.Error == "" {
+			return errors.New("remote call failed")
 		}
-		return errors.New("remote call failed")
+		return errors.New(reply.Error)
 	}
-
-	// 8. Decode the returned value into out (if out is provided and response has a value).
-	if out != nil && len(resp.Value) > 0 {
-		if err := json.Unmarshal(resp.Value, out); err != nil {
-			return fmt.Errorf("failed to decode return value: %v", err)
-		}
+ 
+	if out == nil || len(reply.Value) == 0 {
+		return nil
 	}
-
+	if err := json.Unmarshal(reply.Value, out); err != nil {
+		return fmt.Errorf("decode result into %T: %w", out, err)
+	}
 	return nil
+}
+ 
+// describeNetError labels an I/O failure and names timeouts explicitly.
+func describeNetError(action string, err error, timeout time.Duration) error {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("%s: timed out after %v: %w", action, timeout, err)
+	}
+	return fmt.Errorf("%s: %w", action, err)
 }
