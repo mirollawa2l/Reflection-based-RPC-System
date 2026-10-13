@@ -377,226 +377,369 @@ func drainConnection(connection net.Conn) {
 }
 
 
-// TODO 5: Reject empty or unsafe method names, too many arguments, arguments
-// larger than maxArgumentBytes, and requests larger than maxRequestBytes.
-// validateRequest rejects malformed or abusive requests before reflection runs.
-func validateRequest(req request) error {
 
-	// 1. Check if the method name is empty.
-	if req.Method == "" {
-		return errors.New("method cannot be empty")
-	}
+ // TODO 5: Reject empty or unsafe method names, too many arguments, arguments
+ // larger than maxArgumentBytes, and requests larger than maxRequestBytes.
+ // validateRequest rejects malformed or abusive requests before reflection runs.
+ func validateRequest(req request) error {
 
-	// 2. Check if the method name contains whitespace or control characters.
-	for _, ch := range req.Method {
-		if unicode.IsSpace(ch) || unicode.IsControl(ch) {
-			return errors.New("method contains whitespace or control characters")
+ 	// 1. Check whether the method name is empty.
+ 	// An empty name cannot identify a method to invoke on the server.
+ 	if req.Method == "" {
+ 		return errors.New("method cannot be empty")
+ 	}
+
+ 	// 2. Check whether the method name contains whitespace or control characters.
+ 	// This helps reject malformed names before they are used for reflection.
+ 	// The loop checks each Unicode character in the method name.
+ 	for _, ch := range req.Method {
+ 		if unicode.IsSpace(ch) || unicode.IsControl(ch) {
+ 			return errors.New("method contains whitespace or control characters")
+ 		}
+ 	}
+
+ 	// 3. Check whether the number of arguments exceeds the maximum allowed.
+ 	// This prevents requests from supplying more arguments than the RPC system supports.
+ 	if len(req.Args) > maxArguments {
+ 		return errors.New("too many arguments")
+ 	}
+
+ 	// 4. Check the size of each argument and calculate the total size.
+ 	// RawMessage stores each argument as its original JSON bytes.
+ 	// We count bytes rather than characters to enforce memory and payload limits.
+ 	totalSize := 0
+
+ 	for _, arg := range req.Args {
+
+ 		// Reject an individual argument that exceeds the size limit.
+ 		// This prevents any single argument from being excessively large.
+ 		if len(arg) > maxArgumentBytes {
+ 			return errors.New("argument is larger than maxArgumentBytes")
+ 		}
+
+ 		// Add this argument's byte length to the total request argument size.
+ 		// The accumulated size is checked after all arguments are examined.
+ 		totalSize += len(arg)
+ 	}
+
+ 	// 5. Reject requests whose combined argument size exceeds the limit.
+ 	// Several individually valid arguments could still exceed the total limit together.
+ 	if totalSize > maxRequestBytes {
+ 		return errors.New("request is larger than maxRequestBytes")
+ 	}
+
+ 	// All validation checks passed.
+ 	// Returning nil means the request passed these validation checks.
+ 	return nil
+ }
+
+
+	// TODO 6: Study and test this starter reflection bridge. Your required work is to
+	// support and test exported methods with zero arguments, typed arguments, no
+	// return value, one return value, and a final error return; unknown methods,
+	// wrong argument counts, invalid JSON arguments, returned errors, and panics must
+	// become clear errors instead of crashing the server. Extend the bridge only when
+	// your chosen assignment protocol requires another result or argument rule.
+	// invoke finds a method, converts JSON arguments to its parameter types, and calls it.
+	func (s *Server) invoke(req request) (any, error) {
+		// Use reflection to find the requested method on the registered receiver.
+		// MethodByName can find exported methods; if the method does not exist,
+		// it returns an invalid reflect.Value.
+		method := reflect.ValueOf(s.receiver).MethodByName(req.Method)
+
+		// If the method was not found, return a descriptive error instead of
+		// attempting to call an invalid method and potentially panicking.
+		if !method.IsValid() {
+			return nil, fmt.Errorf("unknown method %q", req.Method)
 		}
-	}
 
-	// 3. Check if the number of arguments exceeds the maximum allowed.
-	if len(req.Args) > maxArguments {
-		return errors.New("too many arguments")
-	}
+		// Get the method's type information so we can inspect its parameters
+		// and return values before calling it.
+		typeOfMethod := method.Type()
 
-	// 4. Check the size of each argument and calculate the total size.
-	totalSize := 0
-
-	for _, arg := range req.Args {
-
-		// Reject an individual argument that exceeds the size limit.
-		if len(arg) > maxArgumentBytes {
-			return errors.New("argument is larger than maxArgumentBytes")
+		// Check whether the number of arguments supplied by the client matches
+		// the number of parameters expected by the method.
+		if typeOfMethod.NumIn() != len(req.Args) {
+			return nil, fmt.Errorf("method %q expects %d arguments, got %d", req.Method, typeOfMethod.NumIn(), len(req.Args))
 		}
 
-		// Add the argument size to the total.
-		totalSize += len(arg)
-	}
+		// Check supported return signatures before invoking the method.
+		// The error interface type is used to identify methods that return errors.
+		errorType := reflect.TypeOf((*error)(nil)).Elem()
 
-	// 5. Reject requests whose combined argument size exceeds the limit.
-	if totalSize > maxRequestBytes {
-		return errors.New("request is larger than maxRequestBytes")
-	}
+		switch typeOfMethod.NumOut() {
+		case 0, 1:
+			// Supported: no result, one result, or error only.
+			// A single return value may itself be an error.
+			// If it is an error, the handling below checks whether it is nil.
 
-	// All validation checks passed.
-	return nil
-}
+		case 2:
+			// Two results require the final result to implement the error interface.
+			// This supports the common Go pattern: (result, error).
+			if !typeOfMethod.Out(1).Implements(errorType) {
+				return nil, fmt.Errorf(
+					"method %q has unsupported return signature",
+					req.Method,
+				)
+			}
 
-// TODO 6: Study and test this starter reflection bridge. Your required work is to
-// support and test exported methods with zero arguments, typed arguments, no
-// return value, one return value, and a final error return; unknown methods,
-// wrong argument counts, invalid JSON arguments, returned errors, and panics must
-// become clear errors instead of crashing the server. Extend the bridge only when
-// your chosen assignment protocol requires another result or argument rule.
-// invoke finds a method, converts JSON arguments to its parameter types, and calls it.
-func (s *Server) invoke(req request) (any, error) {
-	//find the method name by relection
-	method := reflect.ValueOf(s.receiver).MethodByName(req.Method)
-	//if meth not exist err
-	if !method.IsValid() {
-		return nil, fmt.Errorf("unknown method %q", req.Method)
-	}
-	//get meth typr info and check if the number of arguments matches the number of arguments in the request
-	typeOfMethod := method.Type()
-
-	if typeOfMethod.NumIn() != len(req.Args) {
-		return nil, fmt.Errorf("method %q expects %d arguments, got %d", req.Method, typeOfMethod.NumIn(), len(req.Args))
-	}
-
-	// Check supported return signatures.
-	errorType := reflect.TypeOf((*error)(nil)).Elem()
-
-	switch typeOfMethod.NumOut() {
-	case 0, 1:
-		// Supported: no result, one result, or error only.
-
-	case 2:
-		// Two results require the final result to be an error.
-		if !typeOfMethod.Out(1).Implements(errorType) {
+		default:
+			// Reject methods returning more than two values because their
+			// return signature is not supported by this RPC implementation.
 			return nil, fmt.Errorf(
 				"method %q has unsupported return signature",
 				req.Method,
 			)
 		}
 
-	default:
-		return nil, fmt.Errorf(
-			"method %q has unsupported return signature",
-			req.Method,
-		)
-	}
+		// Convert the JSON arguments into Go values of the exact parameter types
+		// expected by the requested method.
+		// Each reflect.Value will be passed to method.Call in the correct order.
+		arguments := make([]reflect.Value, len(req.Args))
 
-	// Convert JSON arguments into Go values.
-	arguments := make([]reflect.Value, len(req.Args))
-	for index, raw := range req.Args {
-		//find expected arg type and allocate value
-		argument := reflect.New(typeOfMethod.In(index))
-		//decode raw JSOn into that type
-		if err := json.Unmarshal(raw, argument.Interface()); err != nil {
-			return nil, fmt.Errorf("argument %d: %v", index, err)
+		for index, raw := range req.Args {
+			// Find the expected type of this parameter and allocate a pointer to it.
+			// For example, if the method expects an int, this creates a *int.
+			argument := reflect.New(typeOfMethod.In(index))
+
+			// Decode the raw JSON argument into the allocated Go value.
+			// Interface() exposes the pointer so json.Unmarshal can populate it.
+			// If the JSON cannot be converted to the expected type, return an error
+			// identifying which argument failed.
+			if err := json.Unmarshal(raw, argument.Interface()); err != nil {
+				return nil, fmt.Errorf("argument %d: %v", index, err)
+			}
+
+			// Dereference the pointer to obtain the actual value expected by
+			// the method, rather than passing the pointer itself.
+			arguments[index] = argument.Elem()
 		}
-		arguments[index] = argument.Elem()
-	}
 
-	outputs, err := callMethodSafely(method, arguments)
+		// Call the method through the panic-safe helper.
+		// The helper returns the method's output values or an error if the
+		// method panics during execution.
+		outputs, err := callMethodSafely(method, arguments)
 
-	if err != nil {
-		return nil, err
-	}
-	if len(outputs) == 0 {
-		return nil, nil
-	}
-	if last := outputs[len(outputs)-1]; last.Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-		if !isNilValue(last) {
-			return nil, last.Interface().(error)
+		// If the method panicked, propagate the recovered error to the caller.
+		if err != nil {
+			return nil, err
 		}
-		outputs = outputs[:len(outputs)-1] // Remove the nil error from the results.
-	}
-	//Handle methods returning only a nil error.
-	if len(outputs) == 0 {
-		return nil, nil
-	}
-	//Return the successful method result.
-	return outputs[0].Interface(), nil
-}
 
-func isNilValue(value reflect.Value) bool {
-	switch value.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		return value.IsNil()
-	default:
-		return false
-	}
-}
-
-func callMethodSafely(method reflect.Value, arguments []reflect.Value) (outputs []reflect.Value, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("remote method panicked: %v", recovered)
+		// If the method returned no values, it completed successfully without
+		// producing a result, so return nil as the RPC result.
+		if len(outputs) == 0 {
+			return nil, nil
 		}
-	}()
-	return method.Call(arguments), nil
-}
 
-// Client calls methods on a remote Server.
-type Client struct {
-	Address string
-	Timeout time.Duration
-}
+		// Check whether the final return value implements the error interface.
+		// If it is a non-nil error, report it instead of returning a successful result.
+		if last := outputs[len(outputs)-1]; last.Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+			// A non-nil error means the remote method reported failure.
+			// isNilValue also handles typed nil values stored in interfaces.
+			if !isNilValue(last) {
+				return nil, last.Interface().(error)
+			}
 
-// NewClient creates a client for a server address.
-func NewClient(address string) (*Client, error) {
-	if address == "" {
-		return nil, errors.New("address cannot be empty")
+			// The final error is nil, so remove it from the outputs.
+			// Only the actual result, if any, should be returned to the client.
+			outputs = outputs[:len(outputs)-1]
+		}
+
+		// Handle methods returning only a nil error.
+		// After removing the nil error, no result values remain.
+		if len(outputs) == 0 {
+			return nil, nil
+		}
+
+		// Return the successful method result.
+		// The assignment supports at most one non-error result value.
+		return outputs[0].Interface(), nil
 	}
-	return &Client{Address: address, Timeout: defaultCallTimeout}, nil
-}
+
+	// isNilValue determines whether a reflected value can safely be checked for nil.
+	// Calling IsNil on a non-nilable type, such as int or string, would panic.
+	func isNilValue(value reflect.Value) bool {
+		switch value.Kind() {
+		// These kinds can hold nil values in Go, so IsNil is valid for them.
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			return value.IsNil()
+		default:
+			// Other kinds cannot be nil, so they are treated as non-nil.
+			return false
+		}
+	}
+
+	// callMethodSafely invokes a reflected method and converts any panic into an error.
+	// This prevents a panic inside a remote method from crashing the server process.
+	func callMethodSafely(method reflect.Value, arguments []reflect.Value) (outputs []reflect.Value, err error) {
+		// A deferred function runs when this function returns, including when
+		// method.Call causes a panic. recover captures the panic value.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				// Convert the panic into a descriptive error that invoke can handle.
+				err = fmt.Errorf("remote method panicked: %v", recovered)
+			}
+		}()
+
+		// Call the method with the prepared arguments and return its reflected outputs.
+		// If the method panics, the deferred recovery function sets err.
+		return method.Call(arguments), nil
+	}
+
+	// Client calls methods on a remote Server.
+	type Client struct {
+		// Address is the network address of the RPC server to connect to.
+		Address string
+
+		// Timeout is the maximum allowed duration for a remote call.
+		Timeout time.Duration
+	}
+
+	// NewClient creates a client for a server address.
+	func NewClient(address string) (*Client, error) {
+		// Reject an empty address because the client needs a destination to connect to.
+		if address == "" {
+			return nil, errors.New("address cannot be empty")
+		}
+
+		// Create the client with the supplied server address and the default call timeout.
+		// The caller can change Timeout later if a different duration is needed.
+		return &Client{Address: address, Timeout: defaultCallTimeout}, nil
+	}
+
+
+
+
 
 // TODO 7: Open one connection, apply a deadline, encode the request, read one
 // response, return remote errors, and decode the response into out.
 // Call invokes method and decodes its result into out. Pass nil for no result.
 // Client.Call invokes a remote method and decodes its result into out. Pass nil for no result.
-
 func (c *Client) Call(method string, out any, args ...any) error {
+
+	// Reject an empty method name before doing any network operations.
+	// There is no method for the server to look up if the name is empty.
 	if method == "" {
 		return errors.New("method cannot be empty")
 	}
+
+	// Use the client's configured timeout.
+	// If the timeout is zero or negative, fall back to the default timeout.
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = defaultCallTimeout
 	}
- 
+
 	// Encode first: a bad argument fails fast without touching the network.
+	// Create a slice to hold the JSON representation of each argument.
+	// Making the slice with make ensures zero arguments are represented as []
+	// instead of null when the request is encoded.
 	encoded := make([]json.RawMessage, len(args)) // never nil, so it is sent as []
+
+	// Convert each Go argument into JSON before connecting to the server.
+	// This catches unsupported argument types early and identifies the
+	// index of the argument that could not be encoded.
 	for index, argument := range args {
 		raw, err := json.Marshal(argument)
 		if err != nil {
 			return fmt.Errorf("encode argument %d: %w", index, err)
 		}
+
+		// Store the JSON bytes so they can be included in the RPC request.
 		encoded[index] = raw
 	}
- 
+
+	// Calculate one absolute deadline for the entire remote call.
+	// This prevents connection setup, sending, and receiving from each
+	// getting a separate full timeout.
 	deadline := time.Now().Add(timeout)
+
+	// Configure the dialer to stop trying to establish the connection
+	// once the overall deadline is reached.
 	dialer := net.Dialer{Deadline: deadline}
+
+	// Open a TCP connection to the server using the configured address.
+	// If connecting fails, return a descriptive error, including timeout
+	// information when the network operation timed out.
 	connection, err := dialer.Dial("tcp", c.Address)
 	if err != nil {
 		return describeNetError(fmt.Sprintf("connect to %s", c.Address), err, timeout)
 	}
+
+	// Ensure the connection is closed when Call returns, whether the call
+	// succeeds or encounters an error.
 	defer connection.Close()
+
 	// One deadline covers the whole exchange: sending, the remote execution and reading.
+	// Apply the deadline to both reads and writes on this connection.
 	if err := connection.SetDeadline(deadline); err != nil {
 		return fmt.Errorf("set deadline: %w", err)
 	}
- 
+
+	// Encode and send the request as one JSON value followed by a newline.
+	// The request contains the method name and its JSON-encoded arguments.
+	// If writing fails, return a descriptive network error.
 	if err := json.NewEncoder(connection).Encode(request{Method: method, Args: encoded}); err != nil {
 		return describeNetError("send request", err, timeout)
 	}
- 
+
+	// Prepare a variable to receive the server's response.
 	var reply response
+
+	// Read and decode one JSON response from the server.
+	// bufio.Reader provides buffering, while json.Decoder parses the response
+	// into the reply structure.
 	if err := json.NewDecoder(bufio.NewReader(connection)).Decode(&reply); err != nil {
 		return describeNetError("read response", err, timeout)
 	}
+
+	// Check whether the server reported a successful remote call.
+	// If the call failed, return the server's error message to the caller.
 	if !reply.OK {
+		// Handle an unsuccessful response that does not contain an error message.
+		// This provides a useful fallback instead of returning an empty error.
 		if reply.Error == "" {
 			return errors.New("remote call failed")
 		}
+
+		// Return the specific error message sent by the server.
 		return errors.New(reply.Error)
 	}
- 
+
+	// If the caller does not need a result, or the response contains no result,
+	// there is nothing to decode. The remote call has still completed successfully.
 	if out == nil || len(reply.Value) == 0 {
 		return nil
 	}
+
+	// Decode the JSON result into the caller-provided output variable.
+	// The caller must pass a pointer to a value of the expected result type.
+	// If the result cannot be decoded into that type, return a descriptive error.
 	if err := json.Unmarshal(reply.Value, out); err != nil {
 		return fmt.Errorf("decode result into %T: %w", out, err)
 	}
+
+	// The request succeeded, and the result was decoded successfully.
 	return nil
 }
- 
+
 // describeNetError labels an I/O failure and names timeouts explicitly.
 func describeNetError(action string, err error, timeout time.Duration) error {
+
+	// Declare a variable that can hold an error implementing net.Error.
+	// Network errors commonly implement this interface, which provides
+	// information such as whether the failure was caused by a timeout.
 	var netErr net.Error
+
+	// errors.As searches the error chain for a net.Error.
+	// If one is found and it reports a timeout, return an error that clearly
+	// states which operation failed and how long the timeout was.
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return fmt.Errorf("%s: timed out after %v: %w", action, timeout, err)
 	}
+
+	// For other network or I/O errors, identify the failed operation and
+	// wrap the original error so callers can still inspect it with errors.Is
+	// or errors.As.
 	return fmt.Errorf("%s: %w", action, err)
 }
