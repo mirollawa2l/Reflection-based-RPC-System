@@ -22,224 +22,269 @@ const (
 	defaultCallTimeout = 5 * time.Second
 )
 
-// const (
-// 	requestReadTimeout   = 5 * time.Second
-// 	responseWriteTimeout = 5 * time.Second
-// 	drainTimeout         = time.Second
-// )
 
+// request represents a method invocation sent from a client to the server.
+// The method name identifies the receiver's method, while Args contains
+// the method arguments encoded as raw JSON messages.
 type request struct {
 	Method string            `json:"method"`
 	Args   []json.RawMessage `json:"args"`
 }
 
+// response represents the server's reply to a client request.
+// OK indicates whether the call succeeded.
+// Value contains the JSON-encoded return value on success.
+// Error contains an error message when the call fails.
 type response struct {
 	OK    bool            `json:"ok"`
 	Value json.RawMessage `json:"value,omitempty"`
 	Error string          `json:"error,omitempty"`
 }
 
-// Server exposes exported methods of a receiver over TCP.
+// Server exposes exported methods of a receiver over a TCP connection.
+// It accepts client requests, invokes the requested methods using reflection,
+// and sends the results back to the clients.
 type Server struct {
-	receiver   any
-	listener   net.Listener
-	stopped    chan struct{}
-	acceptDone chan struct{}
-	workers    sync.WaitGroup
-	mu         sync.Mutex // guards listener, stopped and acceptDone (held only briefly
-    lifecycle  sync.Mutex // serializes Start and Stop so they never overlap
-}
+// receiver is the object whose exported methods will be available remotely.
+	receiver any
 
-// NewServer creates a server for a non-nil pointer receiver.
+	// listener accepts incoming TCP connections from RPC clients.
+	listener net.Listener
+
+	// stopped is closed when the server begins shutting down.
+	// The accept loop uses it to detect a requested shutdown.
+	stopped chan struct{}
+
+	// acceptDone is closed when the accept loop exits.
+	// Stop waits on this channel to ensure the accept loop has finished.
+	acceptDone chan struct{}
+
+	// workers tracks active connection handlers.
+	// Stop waits for all active handlers to finish before returning.
+	workers sync.WaitGroup
+
+	// mu protects shared server state, including listener, stopped,
+	// and acceptDone. It is held briefly when accessing these fields.
+	mu sync.Mutex
+
+	// lifecycle serializes Start and Stop operations.
+	// This prevents starting and stopping the server simultaneously.
+	lifecycle sync.Mutex}
+
+ // NewServer creates a server for a non-nil pointer receiver.
 func NewServer(receiver any) (*Server, error) {
+	// Reject a nil receiver because there is no object to expose remotely.
 	if receiver == nil {
 		return nil, errors.New("receiver cannot be nil")
 	}
+
+	// Get reflection information about the receiver to inspect its type and value.
 	value := reflect.ValueOf(receiver)
+
+	// Require a non-nil pointer so the server can expose the receiver's methods
+	// and modify its underlying object when needed.
 	if value.Kind() != reflect.Pointer || value.IsNil() {
 		return nil, errors.New("receiver must be a non-nil pointer")
 	}
+
+	// Create and return a server that stores the receiver for remote method calls.
 	return &Server{receiver: receiver}, nil
 }
 
-// TODO 1: Create the TCP listener, reject duplicate starts, save lifecycle state,
-// and launch the accept loop without blocking the caller.
+
+
+ // TODO 1: Create the TCP listener, reject duplicate starts, save lifecycle state,
+ // and launch the accept loop without blocking the caller.
 func (s *Server) Start(address string) error {
-	s.lifecycle.Lock()          // Acquire the lock to prevent other goroutines from accessing the protected resource simultaneously.
-defer s.lifecycle.Unlock()  // Ensure the lock is released when the function returns, even if it returns early.
-	
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycle.Lock() // Acquire the lifecycle lock to prevent Start and Stop from running simultaneously.
+	defer s.lifecycle.Unlock() // Ensure the lifecycle lock is released when the function returns, even if it returns early.
+
+	s.mu.Lock() // Lock shared server state before checking or modifying it.
+	defer s.mu.Unlock() // Automatically release the state lock when Start returns.
 
 	//  Benet2kd an el server msh sh8al asln (law el listener msh nil).
 	// Dah bymn3 en 7ad y3ml start marra tanya w hwa sh8al (reject duplicate starts).
 	if s.listener != nil {
-		return errors.New("server is already running")
+		return errors.New("server is already running") // Reject starting the server if it is already running.
 	}
 
 	//  Benft7 TCP listener 3ala el address el matloob (lw b3t "127.0.0.1:0",
 	// el OS hwa elly bykhtar port fadya we ye7gezha).
-	listener, err := net.Listen("tcp", address)
+	listener, err := net.Listen("tcp", address) // Open a TCP listener on the requested address.
 	if err != nil {
-		return err
+		return err // Return the error if the address cannot be bound or the listener cannot be created.
 	}
 
 	//  Ben7fez el listener gwa el server struct w ben3ml initialization ll channels
 	// elly btsa3dna nenazelem el accept loop w n2flha b aman.
-	s.listener = listener
-	s.stopped = make(chan struct{})
-	s.acceptDone = make(chan struct{})
+	s.listener = listener // Store the listener so other server methods can access it.
+	s.stopped = make(chan struct{}) // Create a channel to signal that the server is stopping.
+	s.acceptDone = make(chan struct{}) // Create a channel that signals when the accept loop has finished.
 
 	//  Benbda2 el accept loop fe background goroutine 3ashan el function teRga3
 	// men gher ma ta3ml block ll caller w tefdal tst2bel connections gdeda.
-	go s.acceptLoop()
-	return nil
+	go s.acceptLoop() // Run the accept loop concurrently so Start can return without waiting for connections.
+	return nil // Report that the server started successfully.
 }
 
+// acceptLoop continuously accepts incoming TCP connections until the listener is closed.
 func (s *Server) acceptLoop() {
-	defer close(s.acceptDone)
+	defer close(s.acceptDone) // Signal that the accept loop has finished, even if it exits early.
+
 	for {
-		s.mu.Lock()
-		listener := s.listener
-		s.mu.Unlock()
+		s.mu.Lock() // Lock shared state before reading the listener.
+		listener := s.listener // Copy the current listener while the state is protected.
+		s.mu.Unlock() // Release the lock before performing network operations.
 
 		if listener == nil {
-			return
+			return // Exit if there is no active listener.
 		}
 
-		conn, err := listener.Accept()
+		conn, err := listener.Accept() // Wait for an incoming connection; this blocks until a connection arrives or an error occurs.
 		if err != nil {
-			s.mu.Lock()
+			s.mu.Lock() // Lock shared state before checking the server's stopping status.
 			select {
-			case <-s.stopped:
-				s.mu.Unlock()
-				return
+			case <-s.stopped: // Check whether Stop has signaled that the server is shutting down.
+				s.mu.Unlock() // Release the lock before returning.
+				return // Exit because the server has been stopped.
 			default:
-				s.mu.Unlock()
-				return
+				s.mu.Unlock() // Release the lock when no stop signal is available.
+				return // Exit the accept loop when Accept fails.
 			}
 		}
 
-		s.mu.Lock()
+		s.mu.Lock() // Lock shared state before checking the listener and registering a worker.
 		if s.listener == nil {
-			s.mu.Unlock()
-			conn.Close()
-			return
+			s.mu.Unlock() // Release the lock before closing the rejected connection.
+			conn.Close() // Close the connection because the server is no longer running.
+			return // Exit because the server has stopped accepting connections.
 		}
-		s.workers.Add(1)
-		s.mu.Unlock()
+
+		s.workers.Add(1) // Register this connection handler so Stop can wait for it to finish.
+		s.mu.Unlock() // Release the lock before starting the handler goroutine.
 
 		go func(c net.Conn) {
-			defer s.workers.Done()
-			s.handle(c)
-		}(conn)
+			defer s.workers.Done() // Decrease the worker count when this handler finishes.
+			s.handle(c) // Process the request received over this connection.
+		}(conn) // Pass the accepted connection to the new goroutine.
 	}
 }
 
-// TODO 2: Return the listener address safely while allowing port 0 discovery.
-// Address returns the address assigned to the running server.
+
+
+ // TODO 2: Return the listener address safely while allowing port 0 discovery.
+ // Address returns the address assigned to the running server.
 func (s *Server) Address() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.Lock() // Lock the server state to safely access the listener while other goroutines may modify it.
+	defer s.mu.Unlock() // Ensure the mutex is released when the function returns.
 
 	// Law el server msh sh8al (listener == nil), benrg3 empty string
 	// ( abl el start aw ba3d el stop).
 	if s.listener == nil {
-		return ""
+		return "" // Return an empty string if the server has not started or has already stopped.
 	}
 
 	// Benrg3 el string bta3 el address elly el listener sh8al 3aleih
 	// (w da by3rafna el port el 7a2i2y law knt ba3t port 0 fe el Start).
-	return s.listener.Addr().String()
+	return s.listener.Addr().String() // Return the actual listening address, including the assigned port if Start used port 0.
 }
 
-// TODO 3: Close the listener, signal the accept loop, wait for its workers,
-// and leave the server in a state where Start can be called again.
-// Stop stops accepting new connections and waits for active handlers to finish.
+
+
+ // TODO 3: Close the listener, signal the accept loop, wait for its workers,
+ // and leave the server in a state where Start can be called again.
+ // Stop stops accepting new connections and waits for active handlers to finish.
 
 func (s *Server) Stop() error {
 	// Holding lifecycle for the whole shutdown means a concurrent Start waits
 	// for Stop to finish and a concurrent second Stop becomes a no-op.
-	s.lifecycle.Lock()
-	defer s.lifecycle.Unlock()
-	
-	s.mu.Lock()
+	s.lifecycle.Lock() // Acquire the lifecycle lock so Start and Stop cannot execute simultaneously.
+	defer s.lifecycle.Unlock() // Release the lifecycle lock when Stop returns.
+
+	s.mu.Lock() // Lock shared server state before checking or modifying it.
 
 	// Law el server asln msh sh8al, benrg3  (safe to call before start or multiple times).
 	if s.listener == nil {
-		s.mu.Unlock()
-		return nil
+		s.mu.Unlock() // Release the mutex before returning.
+		return nil // Nothing needs to be stopped, so return successfully.
 	}
 
-	listener := s.listener
-	s.listener = nil // Benfeady el listener w nsfro
-	stoppedChan := s.stopped
-	s.mu.Unlock()
+	listener := s.listener // Save the listener locally so we can close it after releasing the mutex.
+	s.listener = nil // Benfeady el listener w nsfro; mark the server as stopped so new connections are not accepted.
+	stoppedChan := s.stopped // Save the stop signal channel for the shutdown process.
+	s.mu.Unlock() // Release the mutex before performing shutdown operations.
 
 	// 1. Benbe3t signal ll accept loop enha tetla3 (close el stopped channel)
 	// w ben2fl el listener 3ashan el Accept() yetkaser wmayfdalsh mstny.
-	close(stoppedChan)
-	listener.Close()
+	close(stoppedChan) // Notify the accept loop that the server is stopping.
+	_ = listener.Close() // Close the TCP listener to unblock any pending Accept() call.
 
 	// 2. Benstany el accept loop tetla3 tamam
-	<-s.acceptDone
+	<-s.acceptDone // Wait until the accept loop has completely exited.
 
 	// 3. Benstany kol el active workers (connections elly betaamalha handle gowa)
 	// enha tkheles sh8alha tamam (workers.Wait). Dah bykhly el server yestany el active requests tkhls.
-	s.workers.Wait()
+	s.workers.Wait() // Wait for all active connection handlers to finish.
 
-	return nil
+	return nil // Report that shutdown completed successfully.
 }
 
-// TODO 4: Study this starter request handler, then complete and test the protocol
+
+
+ // TODO 4: Study this starter request handler, then complete and test the protocol
 // contract. Add tests for malformed JSON, oversized input, remote errors, panics,
 // and successful calls, and make sure one bad request cannot crash the server or
 // leave a connection hanging. Connect this handler to your completed Start and
 // Stop lifecycle so each accepted connection is processed by a worker safely.
 // handle reads one request, invokes it, and writes one response.
 
+// Maximum time allowed for reading a request from the client.
 const readTimeout = 5 * time.Second
-	const writeTimeout = 5 * time.Second
-	const drainTimeout= time.Second
+
+// Maximum time allowed for writing a response to the client.
+const writeTimeout = 5 * time.Second
+
+// Maximum time allowed to drain unread client input before closing the connection.
+const drainTimeout = time.Second
 
 func (s *Server) handle(connection net.Conn) {
 	// Close the connection when the handler finishes.
-	defer connection.Close()
+	defer connection.Close() // Release the network connection regardless of how the handler exits.
 
 	// Prepare the JSON encoder used to send the response.
-	encoder := json.NewEncoder(connection)
+	encoder := json.NewEncoder(connection) // Convert response structs into JSON and write them to the connection.
 
 	// Track whether unread client input should be drained before closing.
-	drainInput := false
+	drainInput := false // Start with no need to drain; set to true when an error response is sent.
 
 	// sendResponse writes one response and marks failed requests for draining.
 	sendResponse := func(resp response) {
 		if !resp.OK {
-			drainInput = true
+			drainInput = true // Remember to consume unread input before closing after an error response.
 		}
 
 		// Prevent writing the response from blocking indefinitely.
 		_ = connection.SetWriteDeadline(
-			time.Now().Add(writeTimeout),
+			time.Now().Add(writeTimeout), // Set the deadline to the current time plus the allowed write duration.
 		)
 
-		_ = encoder.Encode(resp)
+		_ = encoder.Encode(resp) // Encode the response as JSON and send it to the client.
 	}
 
 	// Deferred calls run last-in, first-out:
 	// recover first, then drain unread input, then close the connection.
 	defer func() {
 		if drainInput {
-			drainConnection(connection)
+			drainConnection(connection) // Consume a bounded amount of unread input to help the client receive the response before closure.
 		}
 	}()
 
 	// Recover from unexpected panics so they do not crash the server.
 	defer func() {
-		if recovered := recover(); recovered != nil {
+		if recovered := recover(); recovered != nil { // Detect a panic and retrieve its value.
 			sendResponse(response{
 				Error: fmt.Sprintf(
-					"remote method panicked: %v",
+					"remote method panicked: %v", // Explain that the remote method panicked and include the panic value.
 					recovered,
 				),
 			})
@@ -248,23 +293,27 @@ func (s *Server) handle(connection net.Conn) {
 
 	// Set a deadline so reading the request cannot block indefinitely.
 	if err := connection.SetReadDeadline(
-		time.Now().Add(readTimeout),
+		time.Now().Add(readTimeout), // Limit how long the server waits for the client to send the request.
 	); err != nil {
 		sendResponse(response{
-			Error: fmt.Sprintf("set read deadline: %v", err),
+			Error: fmt.Sprintf("set read deadline: %v", err), // Return an error if the read deadline could not be configured.
 		})
-		return
+		return // Stop processing this connection because the read deadline could not be set.
 	}
 
-	// Read at most maxRequestBytes + 1 bytes to detect oversized requests.
-	decoder := json.NewDecoder(
-		bufio.NewReader(
-			io.LimitReader(connection, maxRequestBytes+1),
-		),
-	)
+	
+	// Limit the amount of data the decoder can read to one byte
+	// more than the maximum allowed request size.
+	limited := &io.LimitedReader{
+		R: connection,
+		N: maxRequestBytes + 1,
+	}
+
+	// Decode one JSON request without waiting for the client to close
+	// its connection.
+	decoder := json.NewDecoder(bufio.NewReader(limited))
 
 	var req request
-
 	if err := decoder.Decode(&req); err != nil {
 		sendResponse(response{
 			Error: fmt.Sprintf("invalid request: %v", err),
@@ -272,55 +321,59 @@ func (s *Server) handle(connection net.Conn) {
 		return
 	}
 
-	// Clear the read deadline after receiving the request.
-	_ = connection.SetReadDeadline(time.Time{})
-
-	// Reject oversized JSON requests.
-	if decoder.InputOffset() > maxRequestBytes {
+	// If the reader used the extra byte, the request exceeded the limit.
+	if limited.N == 0 {
 		sendResponse(response{
 			Error: "request is larger than allowed",
 		})
 		return
 	}
 
+	// Clear the read deadline after successfully reading the request.
+	_ = connection.SetReadDeadline(time.Time{})
+
+
+
 	// Validate the request before invoking the remote method.
 	if err := validateRequest(req); err != nil {
 		sendResponse(response{
-			Error: err.Error(),
+			Error: err.Error(), // Send the validation failure to the client.
 		})
-		return
+		return // Stop before reflection or method execution if validation fails.
 	}
 
 	// Find and execute the requested method.
-	result, err := s.invoke(req)
+	result, err := s.invoke(req) // Use reflection to call the requested method with its decoded arguments.
 	if err != nil {
 		sendResponse(response{
-			Error: err.Error(),
+			Error: err.Error(), // Send unknown-method, argument, or remote-method errors to the client.
 		})
-		return
+		return // Stop because the remote method did not complete successfully.
 	}
 
 	// Convert the method result into JSON.
-	payload, err := json.Marshal(result)
+	payload, err := json.Marshal(result) // Serialize the method's result so it can be transmitted over TCP.
 	if err != nil {
 		sendResponse(response{
-			Error: fmt.Sprintf("encode result: %v", err),
+			Error: fmt.Sprintf("encode result: %v", err), // Explain that the result could not be serialized.
 		})
-		return
+		return // Stop because the result cannot be encoded.
 	}
 
 	// Send the successful response.
 	sendResponse(response{
-		OK:    true,
-		Value: payload,
+		OK:    true,    // Indicate that the remote call succeeded.
+		Value: payload, // Include the JSON-encoded result in the response.
 	})
 }
 
-
 // drainConnection discards (a bounded amount of) leftover client input.
 func drainConnection(connection net.Conn) {
-	_ = connection.SetReadDeadline(time.Now().Add(drainTimeout))
-	_, _ = io.Copy(io.Discard, io.LimitReader(connection, 2*maxRequestBytes))
+	_ = connection.SetReadDeadline(time.Now().Add(drainTimeout)) // Ensure draining cannot wait indefinitely for more client data.
+	_, _ = io.Copy(
+		io.Discard, // Discard the bytes instead of storing them in memory.
+		io.LimitReader(connection, 2*maxRequestBytes), // Bound the amount of data consumed while draining.
+	)
 }
 
 
