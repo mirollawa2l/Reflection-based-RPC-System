@@ -1,0 +1,330 @@
+// package rpc
+
+// import (
+// 	"bufio"
+// 	"encoding/json"
+// 	"net"
+// 	"strings"
+// 	"sync"
+// 	"testing"
+// 	"time"
+// )
+
+// type extraService struct{}
+
+// func (*extraService) Add(left, right int) int { return left + right }
+
+// func (*extraService) Echo(value string) string { return value }
+
+// func (*extraService) Join(separator string, parts ...string) string {
+// 	return strings.Join(parts, separator)
+// }
+
+// func (*extraService) Pair() (int, int) { return 1, 2 }
+
+// func (*extraService) Nothing() {}
+
+// func (*extraService) NilError() error { return nil }
+
+// func newExtraServer(t *testing.T) *Server {
+// 	t.Helper()
+// 	server, err := NewServer(&extraService{})
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	if err := server.Start("127.0.0.1:0"); err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	t.Cleanup(func() { _ = server.Stop() })
+// 	return server
+// }
+
+// func rawExchange(t *testing.T, address, payload string) response {
+// 	t.Helper()
+// 	connection, err := net.Dial("tcp", address)
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	defer connection.Close()
+// 	if _, err := connection.Write([]byte(payload)); err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	var reply response
+// 	if err := json.NewDecoder(bufio.NewReader(connection)).Decode(&reply); err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	return reply
+// }
+
+// func TestStartOnFixedAddress(t *testing.T) {
+// 	probe, err := net.Listen("tcp", "127.0.0.1:0")
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	address := probe.Addr().String()
+// 	probe.Close()
+
+// 	server, _ := NewServer(&extraService{})
+// 	if err := server.Start(address); err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	defer server.Stop()
+// 	if got := server.Address(); got != address {
+// 		t.Fatalf("Address() = %q, want %q", got, address)
+// 	}
+// }
+
+// func TestPortZeroIsResolved(t *testing.T) {
+// 	server := newExtraServer(t)
+// 	_, port, err := net.SplitHostPort(server.Address())
+// 	if err != nil || port == "0" || port == "" {
+// 		t.Fatalf("Address() = %q, want a concrete port (err=%v)", server.Address(), err)
+// 	}
+// }
+
+// func TestStartFailuresDoNotBreakServer(t *testing.T) {
+// 	first := newExtraServer(t)
+// 	second, _ := NewServer(&extraService{})
+// 	if err := second.Start(first.Address()); err == nil {
+// 		t.Fatal("Start on a busy port succeeded")
+// 	}
+// 	if second.Address() != "" {
+// 		t.Fatal("failed Start left an address behind")
+// 	}
+// 	if err := second.Start("not-an-address"); err == nil {
+// 		t.Fatal("Start on an invalid address succeeded")
+// 	}
+// 	if err := second.Start("127.0.0.1:0"); err != nil {
+// 		t.Fatalf("Start after failures: %v", err)
+// 	}
+// 	second.Stop()
+// }
+
+// func TestRestartServesCalls(t *testing.T) {
+// 	server, _ := NewServer(&extraService{})
+// 	for round := 0; round < 3; round++ {
+// 		if err := server.Start("127.0.0.1:0"); err != nil {
+// 			t.Fatal(err)
+// 		}
+// 		client, _ := NewClient(server.Address())
+// 		var sum int
+// 		if err := client.Call("Add", &sum, round, 10); err != nil || sum != round+10 {
+// 			t.Fatalf("round %d: sum=%d err=%v", round, sum, err)
+// 		}
+// 		if err := server.Stop(); err != nil {
+// 			t.Fatal(err)
+// 		}
+// 		if err := client.Call("Add", &sum, 1, 1); err == nil {
+// 			t.Fatal("call succeeded against a stopped server")
+// 		}
+// 	}
+// }
+
+// func TestResponseMatchesProtocol(t *testing.T) {
+// 	server := newExtraServer(t)
+// 	reply := rawExchange(t, server.Address(), `{"method":"Add","args":[2,3]}`+"\n")
+// 	if !reply.OK || string(reply.Value) != "5" {
+// 		t.Fatalf("got %+v, want ok=true value=5", reply)
+// 	}
+// 	reply = rawExchange(t, server.Address(), `{"method":"Missing","args":[]}`+"\n")
+// 	if reply.OK || reply.Error != `unknown method "Missing"` {
+// 		t.Fatalf("got %+v", reply)
+// 	}
+// }
+
+// func TestWholeRequestOverLimitGetsErrorResponse(t *testing.T) {
+// 	server := newExtraServer(t)
+// 	// Valid JSON, but bigger than maxRequestBytes in total: the reader is cut off.
+// 	payload := `{"method":"Echo","args":["` + strings.Repeat("x", maxRequestBytes+1024) + `"]}` + "\n"
+// 	reply := rawExchange(t, server.Address(), payload)
+// 	if reply.OK || reply.Error == "" {
+// 		t.Fatalf("got %+v, want an error response", reply)
+// 	}
+// 	client, _ := NewClient(server.Address())
+// 	var echoed string
+// 	if err := client.Call("Echo", &echoed, "still alive"); err != nil || echoed != "still alive" {
+// 		t.Fatalf("server unusable after oversized request: %q %v", echoed, err)
+// 	}
+// }
+
+// func TestBadRequestsDoNotCrashServer(t *testing.T) {
+// 	server := newExtraServer(t)
+// 	bad := []string{
+// 		"",
+// 		"{",
+// 		"[1,2,3]\n",
+// 		`{"method":5}` + "\n",
+// 		`{"method":"","args":[]}` + "\n",
+// 		`{"method":"Bad Name","args":[]}` + "\n",
+// 		`{"method":"Add","args":[1,2,3,4,5,6,7,8,9]}` + "\n",
+// 		`{"method":"Add","args":[1.5,2]}` + "\n",
+// 		`{"method":"Pair","args":[]}` + "\n",
+// 		`{"method":"add","args":[1,2]}` + "\n", // wrong case => unknown method
+// 	}
+// 	for _, payload := range bad {
+// 		connection, err := net.Dial("tcp", server.Address())
+// 		if err != nil {
+// 			t.Fatal(err)
+// 		}
+// 		connection.Write([]byte(payload))
+// 		if payload == "" || payload == "{" {
+// 			connection.(*net.TCPConn).CloseWrite()
+// 		}
+// 		var reply response
+// 		if err := json.NewDecoder(connection).Decode(&reply); err != nil {
+// 			t.Fatalf("payload %q: no response: %v", payload, err)
+// 		}
+// 		if reply.OK || reply.Error == "" {
+// 			t.Fatalf("payload %q: got %+v, want error", payload, reply)
+// 		}
+// 		connection.Close()
+// 	}
+// 	client, _ := NewClient(server.Address())
+// 	var sum int
+// 	if err := client.Call("Add", &sum, 1, 2); err != nil || sum != 3 {
+// 		t.Fatalf("server broken after bad requests: %d %v", sum, err)
+// 	}
+// }
+
+// func TestIdleConnectionDoesNotBlockOthers(t *testing.T) {
+// 	server := newExtraServer(t)
+// 	idle, err := net.Dial("tcp", server.Address())
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	defer idle.Close()
+// 	client, _ := NewClient(server.Address())
+// 	var sum int
+// 	if err := client.Call("Add", &sum, 4, 5); err != nil || sum != 9 {
+// 		t.Fatalf("sum=%d err=%v", sum, err)
+// 	}
+// }
+
+// func TestInvokeDirect2(t *testing.T) {
+// 	server, _ := NewServer(&extraService{})
+// 	raw := func(values ...string) []json.RawMessage {
+// 		out := make([]json.RawMessage, len(values))
+// 		for i, v := range values {
+// 			out[i] = json.RawMessage(v)
+// 		}
+// 		return out
+// 	}
+// 	if got, err := server.invoke(request{Method: "Join", Args: raw(`"-"`, `["a","b","c"]`)}); err != nil || got != "a-b-c" {
+// 		t.Fatalf("variadic: %v %v", got, err)
+// 	}
+// 	if got, err := server.invoke(request{Method: "Nothing"}); err != nil || got != nil {
+// 		t.Fatalf("no result: %v %v", got, err)
+// 	}
+// 	if got, err := server.invoke(request{Method: "NilError"}); err != nil || got != nil {
+// 		t.Fatalf("nil error must be success: %v %v", got, err)
+// 	}
+// 	if _, err := server.invoke(request{Method: "Pair"}); err == nil || !strings.Contains(err.Error(), "unsupported return shape") {
+// 		t.Fatalf("Pair error = %v", err)
+// 	}
+// 	if _, err := server.invoke(request{Method: "Add", Args: raw(`1`, `"x"`)}); err == nil || !strings.Contains(err.Error(), "argument 1") {
+// 		t.Fatalf("bad arg error = %v", err)
+// 	}
+// 	if _, err := server.invoke(request{Method: "Add", Args: raw(``, `1`)}); err == nil {
+// 		t.Fatal("empty raw argument accepted")
+// 	}
+// }
+
+// func TestValidateRequestAcceptsLimits(t *testing.T) {
+// 	exactArg := make(json.RawMessage, maxArgumentBytes)
+// 	if err := validateRequest(request{Method: "Echo", Args: []json.RawMessage{exactArg}}); err != nil {
+// 		t.Fatalf("argument of exactly maxArgumentBytes rejected: %v", err)
+// 	}
+// 	maxArgs := make([]json.RawMessage, maxArguments)
+// 	if err := validateRequest(request{Method: "Echo", Args: maxArgs}); err != nil {
+// 		t.Fatalf("maxArguments rejected: %v", err)
+// 	}
+// for _, name := range []string{"Bad\tName", "Bad\x00Name", "Bad\u00a0Name"} {		if err := validateRequest(request{Method: name}); err == nil {
+// 			t.Fatalf("method %q accepted", name)
+// 		}
+// 	}
+// }
+
+// func TestClientCallValidation(t *testing.T) {
+// 	server := newExtraServer(t)
+// 	client, _ := NewClient(server.Address())
+// 	if err := client.Call("", nil); err == nil {
+// 		t.Fatal("empty method accepted")
+// 	}
+// 	if err := client.Call("Add", nil, 1, 2); err != nil {
+// 		t.Fatalf("nil out with a value-returning method: %v", err)
+// 	}
+// 	var sum int
+// 	if err := client.Call("Add", sum, 1, 2); err == nil || !strings.Contains(err.Error(), "decode") {
+// 		t.Fatalf("non-pointer out error = %v", err)
+// 	}
+// 	if err := client.Call("Echo", nil, make(chan int)); err == nil || !strings.Contains(err.Error(), "encode") {
+// 		t.Fatalf("unencodable argument error = %v", err)
+// 	}
+// 	if _, err := NewClient(""); err == nil {
+// 		t.Fatal("empty address accepted")
+// 	}
+// }
+
+// func TestClientTimeoutMentionsTimeout(t *testing.T) {
+// 	listener, err := net.Listen("tcp", "127.0.0.1:0")
+// 	if err != nil {
+// 		t.Fatal(err)
+// 	}
+// 	defer listener.Close()
+// 	go func() { // accept and then stay silent
+// 		connection, err := listener.Accept()
+// 		if err == nil {
+// 			time.Sleep(300 * time.Millisecond)
+// 			connection.Close()
+// 		}
+// 	}()
+// 	client, _ := NewClient(listener.Addr().String())
+// 	client.Timeout = 50 * time.Millisecond
+// 	start := time.Now()
+// 	err = client.Call("Anything", nil)
+// 	if err == nil || !strings.Contains(err.Error(), "timed out") {
+// 		t.Fatalf("error = %v, want a timeout", err)
+// 	}
+// 	if time.Since(start) > 250*time.Millisecond {
+// 		t.Fatalf("Call took %v despite 50ms timeout", time.Since(start))
+// 	}
+// }
+
+// // Run with -race: Address, Start, Stop and calls hammering one server together.
+// func TestLifecycleIsRaceFree(t *testing.T) {
+// 	server, _ := NewServer(&extraService{})
+// 	var wg sync.WaitGroup
+// 	stop := make(chan struct{})
+// 	for worker := 0; worker < 4; worker++ {
+// 		wg.Add(1)
+// 		go func() {
+// 			defer wg.Done()
+// 			for {
+// 				select {
+// 				case <-stop:
+// 					return
+// 				default:
+// 				}
+// 				if address := server.Address(); address != "" {
+// 					client, _ := NewClient(address)
+// 					client.Timeout = 200 * time.Millisecond
+// 					_ = client.Call("Add", nil, 1, 2) // may fail while restarting; must not panic
+// 				}
+// 			}
+// 		}()
+// 	}
+// 	for round := 0; round < 25; round++ {
+// 		_ = server.Start("127.0.0.1:0")
+// 		var stoppers sync.WaitGroup
+// 		for i := 0; i < 3; i++ {
+// 			stoppers.Add(1)
+// 			go func() { defer stoppers.Done(); _ = server.Stop() }()
+// 		}
+// 		stoppers.Wait()
+// 	}
+// 	close(stop)
+// 	wg.Wait()
+// 	if server.Address() != "" {
+// 		t.Fatal("server still has an address")
+// 	}
+// }
