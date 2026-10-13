@@ -597,6 +597,19 @@ func NewClient(address string) (*Client, error) {
 // response, return remote errors, and decode the response into out.
 // Call invokes method and decodes its result into out. Pass nil for no result.
 // Client.Call invokes a remote method and decodes its result into out. Pass nil for no result.
+
+/*
+Call performs the following steps:
+1. Validate the method name and choose a timeout.
+2. Encode the arguments into JSON.
+3. Calculate a deadline and connect to the server.
+4. Defer closing the connection and set its deadline.
+5. Send the RPC request to the server.
+6. Read and decode the server's response.
+7. Check for remote errors.
+8. Decode the returned value into `out`.
+9. Return `nil` if successful; otherwise, return the appropriate error.
+*/
 func (c *Client) Call(method string, out any, args ...any) error {
 
 	// Reject an empty method name before doing any network operations.
